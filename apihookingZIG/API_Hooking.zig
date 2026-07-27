@@ -1,45 +1,6 @@
-//
-// API Hooking Via Trampoline: Zig Port (hardened)
-//
-// Inline trampoline hook on MessageBoxA in user32.dll. The hooked call is
-// redirected to custom_dialog, which logs params and forwards to MessageBoxW
-// with modified text.
-//
-// Build:  zig build            (-> zig-out/bin/Api_Hooking.exe)
-//
-// What this build implements from the original TODO list:
-//
-//   [1] VirtualProtect replaced with a direct NtProtectVirtualMemory syscall.
-//   [2] GetModuleHandleA / GetProcAddress removed from the IAT — modules and
-//       exports are resolved by walking the PEB (Ldr.InMemoryOrderModuleList)
-//       and parsing each module's PE export table.
-//   [3] The first bytes of the target are checked for an existing FF 25 ...
-//       inline hook before we snapshot the prologue, so we don't capture an
-//       EDR's trampoline bytes as our "original" code.
-//   [4] Trampoline write is bracketed by suspending every OTHER thread in the
-//       process (Toolhelp32 enumerate + NtSuspendThread per TID != current,
-//       direct syscalls) and resuming after — closes the TOCTOU window where
-//       the target is half-patched, without NtSuspendProcess self-deadlocking
-//       the caller.
-//   [5] SSNs are resolved at runtime with a HellsGate/HalosGate scan over the
-//       ntdll stub bytes, so the build is not pinned to one OS version's SSN.
-//   [6] std panic chain is replaced with std.debug.no_panic (just @trap), and
-//       the build defaults to ReleaseSmall with exe.strip = true to drop the
-//       DWARF/PDB sections CAPA pattern-matches on.
-//   [7] Freestanding (-target x86_64-windows-none) is left as a build-option
-//       exercise — it drops the CRT/.TLS sections but requires a hand-rolled
-//       entry point and is incompatible with std.os.windows as used here.
-//
-
 const std = @import("std");
 
-// Kill the std panic/crypto/process chain that drags in base64/RC4/XOR
-// signatures. no_panic just traps; no formatted I/O on panic.
 pub const panic = std.debug.no_panic;
-
-// ---------------------------------------------------------------------------
-// Win32 types
-// ---------------------------------------------------------------------------
 
 const DWORD = std.os.windows.DWORD;
 const ULONG = std.os.windows.DWORD;
@@ -57,13 +18,7 @@ const PAGE_EXECUTE_READWRITE: ULONG = 0x40;
 const MB_OK: DWORD = 0x00000000;
 const MB_ICONINFORMATION: DWORD = 0x00000040;
 
-// (HANDLE)-1 == NtCurrentProcess
 const NtCurrentProcess: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-
-// MessageBoxA (the hook target) and MessageBoxW (called from the hook body)
-// stay as ordinary IAT imports — we legitimately call them. Everything else
-// (module/export resolution, memory protection, thread suspension) is done
-// without going through the IAT.
 
 extern "user32" fn MessageBoxA(
     hWnd: HWND,
@@ -79,10 +34,6 @@ extern "user32" fn MessageBoxW(
     uType: DWORD,
 ) callconv(.winapi) i32;
 
-// ---------------------------------------------------------------------------
-// Thread enumeration (for atomic trampoline patching without self-deadlock)
-// ---------------------------------------------------------------------------
-
 const TH32CS_SNAPTHREAD: DWORD = 0x00000004;
 const THREAD_SUSPEND_RESUME: DWORD = 0x0002;
 const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -97,8 +48,6 @@ const THREADENTRY32 = extern struct {
     dwFlags: DWORD,
 };
 
-// Current process/thread IDs read straight from the TEB (gs:0x40 / gs:0x48),
-// i.e. TEB.ClientId.UniqueProcess / UniqueThread — no kernel32 imports needed.
 fn current_pid() DWORD {
     return asm volatile ("mov %%gs:0x40, %[p]"
         : [p] "=r" (-> DWORD),
@@ -110,10 +59,6 @@ fn current_tid() DWORD {
         : [t] "=r" (-> DWORD),
     );
 }
-
-// ---------------------------------------------------------------------------
-// PEB / Ldr / PE structures (x64)
-// ---------------------------------------------------------------------------
 
 const LIST_ENTRY = extern struct {
     Flink: *LIST_ENTRY,
@@ -158,15 +103,10 @@ const LDR_DATA_TABLE_ENTRY = extern struct {
 };
 
 fn get_peb() *PEB {
-    return asm volatile (
-        "mov %%gs:0x60, %[peb]"
+    return asm volatile ("mov %%gs:0x60, %[peb]"
         : [peb] "=r" (-> *PEB),
     );
 }
-
-// ---------------------------------------------------------------------------
-// Little-endian byte readers (avoid alignment faults on PE fields)
-// ---------------------------------------------------------------------------
 
 fn rd_u8(addr: usize) u8 {
     const p: [*]const u8 = @ptrFromInt(addr);
@@ -186,10 +126,6 @@ fn rd_u32(addr: usize) u32 {
         (@as(u32, p[3]) << 24);
 }
 
-// ---------------------------------------------------------------------------
-// PEB walk — find a loaded module's DllBase by lowercased base name
-// ---------------------------------------------------------------------------
-
 fn get_module_base(name_lower: []const u8) ?*anyopaque {
     const ldr = get_peb().Ldr;
     var entry = ldr.InMemoryOrderModuleList.Flink;
@@ -200,7 +136,7 @@ fn get_module_base(name_lower: []const u8) ?*anyopaque {
         const base_name = &ldr_entry.BaseDllName;
         if (base_name.Buffer) |buf_raw| {
             const buf: [*]u16 = @ptrCast(buf_raw);
-            const len: usize = base_name.Length / 2; // bytes -> UTF-16 chars
+            const len: usize = base_name.Length / 2;
             if (len == name_lower.len) {
                 var match = true;
                 var i: usize = 0;
@@ -219,24 +155,20 @@ fn get_module_base(name_lower: []const u8) ?*anyopaque {
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// PE export table walk — resolve an export by (case-sensitive) name
-// ---------------------------------------------------------------------------
-
 fn get_export_address(base: *anyopaque, func_name: []const u8) ?*anyopaque {
     const base_addr = @intFromPtr(base);
 
     const e_lfanew = rd_u32(base_addr + 0x3C);
-    const opt_hdr = base_addr + e_lfanew + 4 + 20; // skip signature + file header
-    const export_rva = rd_u32(opt_hdr + 0x70); // DataDirectory[0].VirtualAddress
-    const export_size = rd_u32(opt_hdr + 0x74); // DataDirectory[0].Size
+    const opt_hdr = base_addr + e_lfanew + 4 + 20;
+    const export_rva = rd_u32(opt_hdr + 0x70);
+    const export_size = rd_u32(opt_hdr + 0x74);
     if (export_rva == 0) return null;
 
     const export_dir = base_addr + export_rva;
     const num_names = rd_u32(export_dir + 0x18);
-    const funcs_rva = rd_u32(export_dir + 0x1C); // AddressOfFunctions
-    const names_rva = rd_u32(export_dir + 0x20); // AddressOfNames
-    const ords_rva = rd_u32(export_dir + 0x24); // AddressOfNameOrdinals
+    const funcs_rva = rd_u32(export_dir + 0x1C);
+    const names_rva = rd_u32(export_dir + 0x20);
+    const ords_rva = rd_u32(export_dir + 0x24);
     if (num_names == 0) return null;
 
     const names = base_addr + names_rva;
@@ -249,7 +181,6 @@ fn get_export_address(base: *anyopaque, func_name: []const u8) ?*anyopaque {
         if (ascii_streq(base_addr + name_rva, func_name)) {
             const ord = rd_u16(ords + @as(usize, i) * 2);
             const func_rva = rd_u32(funcs + @as(usize, ord) * 4);
-            // Forwarder RVAs point inside the export directory; skip them.
             if (func_rva >= export_rva and func_rva < export_rva + export_size) {
                 return null;
             }
@@ -269,17 +200,6 @@ fn ascii_streq(name_addr: usize, target: []const u8) bool {
     return p[target.len] == 0;
 }
 
-// ---------------------------------------------------------------------------
-// HellsGate / HalosGate — resolve an Nt* syscall SSN from its ntdll stub
-// ---------------------------------------------------------------------------
-//
-// Win10/11 ntdll syscall stubs start with:
-//     4C 8B D1          mov r10, rcx
-//     B8 <ssn:u32>      mov eax, SSN
-// If the stub is hooked (e.g. an EDR patched the prologue with a JMP), the
-// signature won't match. We then scan forward for the next intact stub and
-// back-derive the original SSN by counting how many stubs we skipped.
-
 const STUB_SIG = [_]u8{ 0x4C, 0x8B, 0xD1, 0xB8 };
 const STUB_SCAN_LIMIT: usize = 0x500;
 
@@ -290,12 +210,10 @@ fn matches_sig(addr: usize) bool {
 }
 
 fn resolve_ssn(stub_addr: usize) ?u32 {
-    // HellsGate: target stub intact.
     if (matches_sig(stub_addr)) {
         return rd_u32(stub_addr + 4);
     }
 
-    // HalosGate: scan forward for an intact stub, back-derive SSN.
     var skipped: u32 = 0;
     var off: usize = 1;
     while (off + 8 <= STUB_SCAN_LIMIT) : (off += 1) {
@@ -303,19 +221,12 @@ fn resolve_ssn(stub_addr: usize) ?u32 {
             skipped += 1;
             const found_ssn = rd_u32(stub_addr + off + 4);
             const candidate = found_ssn -% skipped;
-            // Syscall numbers on Win10/11 x64 are small positive values.
             if (candidate < 0x1000) return candidate;
         }
     }
     return null;
 }
 
-// ---------------------------------------------------------------------------
-// Direct syscall stubs
-// ---------------------------------------------------------------------------
-
-// 2-arg syscall (NtSuspendThread / NtResumeThread). The 2nd arg
-// (PreviousSuspendCount*) may be NULL.
 fn syscall2(ssn: u32, arg1: usize, arg2: usize) NTSTATUS {
     return asm volatile (
         \\mov %[a1], %%rcx
@@ -330,8 +241,6 @@ fn syscall2(ssn: u32, arg1: usize, arg2: usize) NTSTATUS {
         : .{ .rax = true, .rcx = true, .rdx = true, .r10 = true, .r11 = true, .memory = true });
 }
 
-// NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize, NewProtect,//                        *OldProtect) — 5th arg goes on the user stack at
-// [rsp+0x28] per the x64 syscall ABI.
 fn nt_protect_virtual_memory(
     ssn: u32,
     process: usize,
@@ -353,17 +262,13 @@ fn nt_protect_virtual_memory(
         \\add $0x38, %%rsp
         : [ret] "={eax}" (-> NTSTATUS),
         : [ssn] "r" (ssn),
-          [p]   "r" (process),
-          [b]   "r" (@intFromPtr(base)),
-          [s]   "r" (@intFromPtr(size)),
-          [n]   "r" (@as(u64, new_protect)),
-          [o]   "r" (@intFromPtr(old_protect)),
+          [p] "r" (process),
+          [b] "r" (@intFromPtr(base)),
+          [s] "r" (@intFromPtr(size)),
+          [n] "r" (@as(u64, new_protect)),
+          [o] "r" (@intFromPtr(old_protect)),
         : .{ .rax = true, .rcx = true, .rdx = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .memory = true });
 }
-
-// ---------------------------------------------------------------------------
-// Resolved imports + SSNs (populated once in main)
-// ---------------------------------------------------------------------------
 
 const Imports = struct {
     ntdll_base: *anyopaque,
@@ -372,8 +277,6 @@ const Imports = struct {
     nt_suspend_thread_ssn: u32,
     nt_resume_thread_ssn: u32,
     message_box_a: *anyopaque,
-    // kernel32 exports (resolved via PEB, called through function pointers so
-    // GetModuleHandleA/GetProcAddress stay out of the IAT).
     create_toolhelp32_snapshot: *const fn (DWORD, DWORD) callconv(.winapi) HANDLE,
     thread32_first: *const fn (HANDLE, *THREADENTRY32) callconv(.winapi) BOOL,
     thread32_next: *const fn (HANDLE, *THREADENTRY32) callconv(.winapi) BOOL,
@@ -397,7 +300,6 @@ fn resolve_imports() ?Imports {
 
     const message_box_a = get_export_address(user32_base, "MessageBoxA") orelse return null;
 
-    // kernel32 thread-enumeration exports, resolved the same PEB/PE way.
     const kernel32_base = get_module_base("kernel32.dll") orelse return null;
     const create_snap = get_export_address(kernel32_base, "CreateToolhelp32Snapshot") orelse return null;
     const t32first = get_export_address(kernel32_base, "Thread32First") orelse return null;
@@ -422,11 +324,6 @@ fn resolve_imports() ?Imports {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Interceptor
-// ---------------------------------------------------------------------------
-
-// 64-bit trampoline: 6 bytes JMP [RIP+0] + 8 bytes absolute address = 14 bytes
 const INTERCEPTOR_SIZE: usize = 14;
 
 const ApiInterceptor = struct {
@@ -445,8 +342,6 @@ const ApiInterceptor = struct {
     }
 };
 
-// setup_interceptor — snapshot the prologue, check it isn't already hooked,
-// and flip memory to PAGE_EXECUTE_READWRITE via a direct syscall.
 fn setup_interceptor(
     imp: *const Imports,
     target_function: *anyopaque,
@@ -458,16 +353,13 @@ fn setup_interceptor(
 
     const t: [*]u8 = @ptrCast(target_function);
 
-    // [3] existing-hook check: an EDR inline hook typically starts FF 25 ...
     if (t[0] == 0xFF and t[1] == 0x25) {
         std.debug.print("[!] Target prologue already patched (FF 25 ...) — aborting\n", .{});
         return false;
     }
 
-    // Snapshot original bytes.
     @memcpy(ic.original_code[0..], t[0..INTERCEPTOR_SIZE]);
 
-    // [1] NtProtectVirtualMemory via direct syscall.
     var base: usize = @intFromPtr(target_function);
     var region_size: usize = INTERCEPTOR_SIZE;
     var old_prot: ULONG = 0;
@@ -487,10 +379,6 @@ fn setup_interceptor(
     return true;
 }
 
-// [4] Atomicity: suspend every OTHER thread in this process, patch, resume.
-// NtSuspendProcess self-deadlocks the caller, so we enumerate threads via
-// Toolhelp32 and NtSuspendThread each TID != current. Handles are stashed for
-// the matching resume.
 var g_suspended: [128]?HANDLE = [_]?HANDLE{null} ** 128;
 var g_suspended_count: usize = 0;
 
@@ -539,12 +427,10 @@ fn resume_other_threads(imp: *const Imports) void {
     g_suspended_count = 0;
 }
 
-// activate_interceptor — suspend sibling threads, write the trampoline, resume.
 fn activate_interceptor(imp: *const Imports, ic: *ApiInterceptor) bool {
     const target = ic.target_function orelse return false;
     const replacement = ic.replacement_function orelse return false;
 
-    // [4] close the TOCTOU window on the patch.
     suspend_other_threads(imp);
 
     const jmp_prefix = [6]u8{ 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
@@ -557,7 +443,6 @@ fn activate_interceptor(imp: *const Imports, ic: *ApiInterceptor) bool {
     return true;
 }
 
-// deactivate_interceptor — restore prologue + protection, clear the struct.
 fn deactivate_interceptor(imp: *const Imports, ic: *ApiInterceptor) bool {
     const target = ic.target_function orelse return false;
 
@@ -584,10 +469,6 @@ fn deactivate_interceptor(imp: *const Imports, ic: *ApiInterceptor) bool {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Hook body — must match MessageBoxA's calling convention exactly
-// ---------------------------------------------------------------------------
-
 fn custom_dialog(
     hwnd: HWND,
     lp_text: LPCSTR,
@@ -601,7 +482,6 @@ fn custom_dialog(
     std.debug.print("\tText:    {s}\n", .{text});
     std.debug.print("\tCaption: {s}\n", .{caption});
 
-    // UTF-16LE replacement strings (null-terminated).
     const new_text_u8 = "sw64 Is a Good Guy";
     const new_caption_u8 = "System Dialog";
 
@@ -619,10 +499,6 @@ fn custom_dialog(
     );
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
 pub fn main() void {
     const imp = resolve_imports() orelse {
         std.debug.print("[ERROR] PEB / syscall resolution failed\n", .{});
@@ -639,10 +515,8 @@ pub fn main() void {
         return;
     }
 
-    // 1. Before hook — normal dialog.
     _ = MessageBoxA(null, "Testing system", "System info", MB_OK | MB_ICONINFORMATION);
 
-    // 2. Activate.
     std.debug.print("[INFO] Activating API Interceptor...\n", .{});
     if (!activate_interceptor(&imp, &ic)) {
         std.debug.print("[ERROR] Interceptor activation failed\n", .{});
@@ -650,10 +524,8 @@ pub fn main() void {
     }
     std.debug.print("[INFO] Interceptor activated\n", .{});
 
-    // 3. While hooked — redirected to custom_dialog.
     _ = MessageBoxA(null, "Sw64 Is Bad Guy...", "System Info", MB_OK | MB_ICONINFORMATION);
 
-    // 4. Deactivate.
     std.debug.print("[INFO] Deactivating API interceptor...\n", .{});
     if (!deactivate_interceptor(&imp, &ic)) {
         std.debug.print("[ERROR] Interceptor deactivation failed\n", .{});
@@ -661,7 +533,6 @@ pub fn main() void {
     }
     std.debug.print("[INFO] Interceptor deactivated\n", .{});
 
-    // 5. After hook — normal dialog again.
     _ = MessageBoxA(null, "System Restored", "System Info", MB_OK | MB_ICONINFORMATION);
 
     std.debug.print("[INFO] PoC Demonstrated Successfully\n", .{});
