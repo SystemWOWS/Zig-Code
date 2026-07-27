@@ -1,0 +1,6 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+lnk
+lnk.exe
+lnk.pdb
