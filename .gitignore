@@ -1,8 +1,0 @@
-# Zig build artifacts
-.zig-cache/
-zig-cache/
-zig-out/
-
-# Windows artifacts
-*.pdb
-*.exe
